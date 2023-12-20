@@ -1,27 +1,23 @@
 (ns clickr.s3
-  (:require [amazonica.aws.s3 :as s3]
-            [clojure.string :as string]
-            [clojure.java.io :as io])
-  (:import (java.io ByteArrayInputStream)))
+  (:require [babashka.fs :as fs]
+            [cognitect.aws.client.api :as aws]))
 
-(def key-regex #"[^-!_.*'()0-9A-Za-z]")
+(defn init-client [{:keys [aws-region] :as ctx}]
+  (let [client (aws/client {:api :s3, :region aws-region})]
+    (assoc ctx :s3 {:client client})))
 
-(defn ->key [s]
-  (string/replace s key-regex "-"))
+(defn upload-photo! [{:keys [s3 s3-bucket s3-prefix] :as ctx}
+                     {:keys [out-file] :as photo}]
+  (let [s3-key (format "%s/%s/%s"
+                       s3-prefix
+                       (-> photo :out-file fs/parent fs/file-name)
+                       (-> photo :out-file fs/file-name))]
+    (aws/invoke (:client s3)
+                {:op :PutObject
+                 :request {:Bucket s3-bucket
+                           :Key s3-key
+                           :Body (fs/read-all-bytes out-file)}})
+    (assoc photo :s3-key s3-key)))
 
-(defn put-html! [bucket prefix filename html]
-  (let [bytes (.getBytes html "UTF-8")]
-    (with-open [in (ByteArrayInputStream. bytes)]
-      (s3/put-object bucket
-                     (str prefix "/" filename)
-                     in
-                     {:content-type "text/html"
-                      :content-length (count bytes)}))))
-
-(defn upload-photo! [bucket prefix filename photo]
-  (with-open [in (io/input-stream filename)]
-    (s3/put-object bucket
-                   (str prefix "/" (->key (.getName (io/file filename))) ".jpg")
-                   in
-                   {:content-type "image/jpeg"}))
-  photo)
+(defn upload-album! [ctx {:keys [photos] :as album}]
+  (update album :photos #(doall (map (partial upload-photo! ctx) %))))

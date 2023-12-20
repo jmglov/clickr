@@ -1,4 +1,8 @@
 (ns clickr.flickr
+  (:require [babashka.fs :as fs]
+            [clickr.util :as util]
+            [clojure.java.io :as io]
+            [clojure.string :as str])
   (:import (com.flickr4java.flickr Flickr
                                    RequestContext
                                    REST)
@@ -6,52 +10,52 @@
            (com.flickr4java.flickr.photos Size)
            (com.flickr4java.flickr.util FileAuthStore)
            (java.io BufferedInputStream
-                    File
                     FileOutputStream)
-           (java.util UUID))
-  (:require [clojure.java.io :as io]
-            [clojure.string :as string]))
-
-(def tmpdir "/tmp")
+           (javax.imageio ImageIO)))
 
 (defn make-auth-store []
-  (FileAuthStore. (io/file (str (System/getProperty "user.home")
-                                File/separatorChar
-                                ".flickrAuth"))))
+  (FileAuthStore. (fs/file (fs/home) ".flickrAuth")))
 
-(defn login-url [{:keys [flickr] :as client} api-key secret]
-  (let [auth (.getAuthInterface flickr)
-        req-token (.getRequestToken auth)]
-    (merge client
-           {:auth-url (.getAuthorizationUrl auth req-token Permission/READ)
-            :auth auth
-            :req-token req-token})))
+(defn authorise [{:keys [flickr] :as ctx}]
+  (let [{:keys [client auth-store req-token token-key]} flickr
+        auth-interface (.getAuthInterface client)
+        auth (-> auth-store .retrieveAll first)]
+    (cond
+      ;; We have a valid access token from the auth store
+      auth
+      (do
+        (.setAuth (RequestContext/getRequestContext) auth)
+        (update ctx :flickr assoc :auth auth))
 
-(defn login [{:keys [auth auth-store req-token] :as client} code]
-  (let [access-token (.checkToken auth (.getAccessToken auth req-token code))]
-    (.store auth-store access-token)
-    (assoc client :access-token access-token)))
+      ;; We have a request token and a token key, so exchange the request
+      ;; token for an access token
+      (and req-token token-key)
+      (let [access-token (.getAccessToken auth-interface req-token token-key)
+            auth (.checkToken auth-interface access-token)]
+        (.setAuth (RequestContext/getRequestContext) auth)
+        (.store auth-store auth)
+        (update ctx :flickr dissoc :req-token :token-key :url))
 
-(defn make-client [api-key secret]
-  (let [client {:flickr (Flickr. api-key secret (REST.))
-                :auth-store (make-auth-store)}
-        [auth & _] (.retrieveAll (:auth-store client))]
-    (if auth
-      (let [request-context (RequestContext/getRequestContext)]
-        (.setAuth request-context auth)
-        (assoc client
-               :auth auth
-               :request-context request-context))
-      (let [client (login-url client api-key secret)]
-        (println "Authentication required; visit"
-                 (:auth-url client)
-                 "in your browser, then call (login client code)")
-        client))))
+      ;; We don't have any tokens, so grab a request token and the URL to
+      ;; authorise it
+      :default
+      (let [req-token (.getRequestToken auth-interface)
+            url (.getAuthorizationUrl auth-interface req-token Permission/READ)]
+        (update ctx :flickr assoc :url url, :req-token req-token)))))
 
-(defn ->photo [photo]
-  (let [filename (str tmpdir File/separatorChar "clickr-" (UUID/randomUUID))
-        thumbnail-filename (str filename "-thumbnail")]
-    {:id (.getId photo)
+(defn init-client [{:keys [api-key secret] :as ctx}]
+  (let [client (Flickr. api-key secret (REST.))
+        auth-store (make-auth-store)]
+    (-> ctx
+        (assoc :flickr {:client client, :auth-store auth-store})
+        authorise)))
+
+(defn ->photo [_ photo]
+  (let [id (.getId photo)
+        extension (.getOriginalFormat photo)
+        filename (format "%s.%s" id extension)]
+    {:id id
+     :filename filename
      :title (.getTitle photo)
      :description (.getDescription photo)
      :date-taken (.getDateTaken photo)
@@ -59,37 +63,42 @@
      :height (.getOriginalHeight photo)
      :geo-data (.getGeoData photo)
      :rotation (.getRotation photo)
-     :filename filename
-     :thumbnail-filename thumbnail-filename
      :object photo}))
 
-(defn ->album [{:keys [flickr] :as client} photoset]
-  {:title (.getTitle photoset)
-   :description (.getDescription photoset)
-   :primary-photo (.. photoset getPrimaryPhoto getId)
-   :photos (map ->photo (.getPhotos (.getPhotosetsInterface flickr) (.getId photoset) 500 1))
-   :object photoset})
+(defn ->album [{:keys [flickr] :as ctx} photoset]
+  (let [ps-interface (.getPhotosetsInterface (:client flickr))]
+    {:id (.getId photoset)
+     :title (.getTitle photoset)
+     :description (.getDescription photoset)
+     :photos (->> (.getPhotos ps-interface (:id album) 500 1)
+                  (map (partial ->photo ctx)))
+     :object photoset}))
 
-(defn get-albums [{:keys [auth flickr] :as client}]
-  (let [user-id (.. auth getUser getId)]
-    (->> (-> flickr
+(defn get-albums [{:keys [flickr] :as ctx}]
+  (let [user-id (.. (:auth flickr) getUser getId)]
+    (->> (-> (:client flickr)
              (.getPhotosetsInterface)
              (.getList user-id)
              (.getPhotosets))
-         (map (partial ->album client)))))
+         (map (partial ->album ctx)))))
 
-(defn download-file! [image-stream filename]
-  (with-open [in (BufferedInputStream. image-stream)
-              out (FileOutputStream. (io/file filename))]
-    (io/copy in out)))
+(defn download-photo! [{:keys [flickr out-dir] :as ctx}
+                       {:keys [filename] :as photo}]
+  (let [p-interface (.getPhotosInterface (:client flickr))
+        out-file (fs/file out-dir filename)]
+    (when-not (fs/exists? out-file)
+      (with-open [in (BufferedInputStream. (.getImageAsStream p-interface (:object photo) Size/LARGE))
+                  out (FileOutputStream. out-file)]
+        (io/copy in out)))
+    (let [img (ImageIO/read out-file)]
+      (assoc photo
+             :out-file out-file
+             :width (.getWidth img)
+             :height (.getHeight img)))))
 
-(defn download-photo!
-  [{:keys [flickr] :as client} {:keys [filename thumbnail-filename object] :as photo}]
-  (let [photos-interface (.getPhotosInterface flickr)]
-    (download-file! (.getImageAsStream photos-interface object Size/LARGE) filename)
-    (download-file! (.getImageAsStream photos-interface object Size/THUMB) thumbnail-filename))
-  photo)
-
-(defn download-album! [client {:keys [photos] :as album}]
-  (doall (map (partial download-photo! client) photos))
-  album)
+(defn download-album! [ctx {:keys [id photos] :as album}]
+  (let [album-dir (->> id (fs/file (fs/temp-dir)) fs/create-dirs fs/file)
+        photos (->> photos
+                    (map (partial download-photo! (assoc ctx :out-dir album-dir)))
+                    doall)]
+    (assoc album :out-dir album-dir, :photos photos)))
